@@ -1,0 +1,151 @@
+# CI pipeline za Pull Requestove ka dev grani (Java / Maven / Flyway).
+# Pokriva zahteve TR-1..TR-6, TI-1..TI-4, UP-1..UP-3, MG1, MG2, MG4, BT-1..BT-4.
+name: PR checks (dev)
+
+on:
+  pull_request:
+    branches: [dev]                                      # TR-5: samo PR-ovi ka dev
+    types: [opened, synchronize, edited, reopened]       # TR-1, TR-2, TR-3, TR-4
+
+concurrency:                                             # TR-6: novo izvršavanje otkazuje staro
+  group: pr-dev-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  checks: write          # potrebno za objavu izveštaja o testovima (BT-4)
+  pull-requests: read
+
+env:
+  JAVA_VERSION: '17'                                     # TODO: verzija Jave u projektu
+  MIGRATIONS_FOLDER: 'db/migration'                      # Flyway podrazumevana lokacija
+  MAVEN_ARGS: '-B -ntp'                                  # batch mode, bez download loga
+
+jobs:
+  pr-checks:
+    name: PR checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # (Opciono, MG4) Baza za proveru migracija; odkomentarisati zajedno sa korakom "3c".
+    # services:
+    #   postgres:
+    #     image: postgres:16
+    #     env:
+    #       POSTGRES_DB: ci
+    #       POSTGRES_USER: ci
+    #       POSTGRES_PASSWORD: ci
+    #     ports: ['5432:5432']
+    #     options: >-
+    #       --health-cmd "pg_isready -U ci" --health-interval 5s --health-timeout 5s --health-retries 10
+
+    steps:
+      # Checkout HEAD commita PR grane, NE podrazumevanog merge commita
+      # (refs/pull/N/merge uvek sadrži dev, pa bi provera ažurnosti uvek prolazila).
+      - name: Checkout PR grane
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Fetch dev grane
+        run: git fetch --no-tags origin +refs/heads/dev:refs/remotes/origin/dev
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+
+      # Alat nema zavisnosti, pa se kompajlira samo sa javac (par sekundi, bez Maven-a).
+      - name: Kompajliranje CI alata
+        run: |
+          javac -encoding UTF-8 -d .ci-tools $(find tools/ci-checks/src/main/java -name '*.java')
+
+      # ---------- 1. Provera naslova (TI-1, TI-2, TI-4) ----------
+      # Naslov ide kroz env promenljivu, ne direktno u skriptu (zaštita od script injection-a).
+      - name: "1. Format naslova PR-a"
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: java -cp .ci-tools ci.checks.Main title
+
+      # ---------- 1b. (Opciono) Jira task postoji (TI-3) ----------
+      # Aktivira se kad se postavi repository variable JIRA_BASE_URL
+      # i secrets JIRA_EMAIL i JIRA_API_TOKEN.
+      - name: "1b. Jira task postoji"
+        if: ${{ vars.JIRA_BASE_URL != '' }}
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          KEY=$(printf '%s' "$PR_TITLE" | grep -oE '^CMS-[0-9]+')
+          if [ -z "$JIRA_API_TOKEN" ]; then
+            echo "::error title=Jira::JIRA_API_TOKEN secret nije dostupan (npr. PR iz fork-a)."
+            exit 1
+          fi
+          STATUS=$(curl -s -o /dev/null -w '%{http_code}' \
+            -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY?fields=key")
+          case "$STATUS" in
+            200) echo "OK - Jira task $KEY postoji" ;;
+            404) echo "::error title=Jira::Jira task $KEY ne postoji ili nemate pristup."; exit 1 ;;
+            *)   echo "::error title=Jira::Neočekivan odgovor Jira API-ja: HTTP $STATUS"; exit 1 ;;
+          esac
+
+      # ---------- 2. Grana ažurna u odnosu na dev (UP-1..UP-3) ----------
+      - name: "2. Grana ažurna sa dev"
+        run: |
+          if git merge-base --is-ancestor origin/dev HEAD; then
+            echo "OK - grana sadrži poslednji commit sa dev"
+          else
+            BEHIND=$(git rev-list --count HEAD..origin/dev)
+            echo "::error title=Grana nije ažurna::Grana zaostaje za dev ($BEHIND commit(a)). Uradite 'git fetch origin && git rebase origin/dev' (ili 'git merge origin/dev') i ponovo push-ujte."
+            exit 1
+          fi
+
+      # ---------- 3. Redosled migracija (MG1, MG2) ----------
+      - name: "3. Redosled migracija"
+        run: java -cp .ci-tools ci.checks.Main migrations --base origin/dev --folder "$MIGRATIONS_FOLDER"
+
+      # ---------- 3c. (Opciono) Migracije na čistoj bazi (MG4) ----------
+      # Flyway Docker image ima ugrađene JDBC drajvere, pa ne zavisi od pom.xml-a.
+      # - name: "3c. Migracije na praznoj bazi"
+      #   run: |
+      #     docker run --rm --network host \
+      #       -v "$PWD/src/main/resources/db/migration:/flyway/sql" \
+      #       flyway/flyway:10 \
+      #       -url=jdbc:postgresql://localhost:5432/ci -user=ci -password=ci migrate
+
+      # ---------- 4. Build (BT-1) ----------
+      - name: "4. Build"
+        run: mvn $MAVEN_ARGS -DskipTests package
+
+      # ---------- 5. Testovi (BT-2, BT-3) ----------
+      # verify pokreće sve testove u svim modulima (surefire, i failsafe ako je podešen).
+      # Pad bilo kog testa obara korak.
+      - name: "5. Testovi"
+        run: mvn $MAVEN_ARGS verify
+
+      - name: "5b. Testovi CI alata"
+        run: mvn $MAVEN_ARGS -f tools/ci-checks/pom.xml test
+
+      # ---------- Objava rezultata (BT-4) ----------
+      - name: Upload rezultata testova (artefakt)
+        if: ${{ !cancelled() && hashFiles('**/target/surefire-reports/TEST-*.xml', '**/target/failsafe-reports/TEST-*.xml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            **/target/surefire-reports/TEST-*.xml
+            **/target/failsafe-reports/TEST-*.xml
+
+      - name: Izveštaj o testovima na PR-u
+        if: ${{ !cancelled() && hashFiles('**/target/surefire-reports/TEST-*.xml', '**/target/failsafe-reports/TEST-*.xml') != '' }}
+        uses: dorny/test-reporter@v1
+        with:
+          name: Rezultati testova
+          path: '**/target/surefire-reports/TEST-*.xml,**/target/failsafe-reports/TEST-*.xml'
+          reporter: java-junit
