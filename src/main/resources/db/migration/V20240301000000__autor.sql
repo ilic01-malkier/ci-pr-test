@@ -1,0 +1,1 @@
+CREATE TABLE autor (id INT PRIMARY KEY);
