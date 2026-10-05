@@ -1,0 +1,1 @@
+CREATE TABLE stranica (id INT PRIMARY KEY, naslov VARCHAR(200));
