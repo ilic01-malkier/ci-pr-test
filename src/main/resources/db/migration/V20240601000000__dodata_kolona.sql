@@ -1,0 +1,1 @@
+ALTER TABLE stranica ADD opis VARCHAR(500);
